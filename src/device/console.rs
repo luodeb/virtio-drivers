@@ -190,6 +190,9 @@ impl<H: Hal, T: Transport> VirtIOConsole<H, T> {
     pub fn recv(&mut self, pop: bool) -> Result<Option<u8>> {
         self.finish_receive()?;
         if self.cursor == self.pending_len {
+            if pop {
+                self.poll_retrieve()?;
+            }
             return Ok(None);
         }
         let ch = self.queue_buf_rx[self.cursor];

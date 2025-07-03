@@ -1,6 +1,6 @@
 [package]
 name = "virtio-drivers"
-version = "0.7.5"
+version = "0.7.4"
 license = "MIT"
 authors = [
   "Jiajie Chen <noc@jiegec.ac.cn>",
@@ -15,7 +15,7 @@ keywords = ["virtio"]
 categories = ["hardware-support", "no-std"]
 
 [dependencies]
-log = "0.4.22"
+log = "=0.4.21"
 bitflags = "2.6.0"
 enumn = "0.1.14"
 zerocopy = { version = "0.7.35", features = ["derive"] }
