@@ -496,6 +496,169 @@ pub const SECTOR_SIZE: usize = 512;
 /// The standard sector size as a u64 constant.
 pub const SECTOR_SIZE_U64: u64 = SECTOR_SIZE as u64;
 
+#[cfg(feature = "alloc")]
+mod file_backend {
+    use super::*;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::cell::UnsafeCell;
+
+    /// A simple spinlock for no_std environments
+    pub struct SpinLock<T> {
+        lock: AtomicBool,
+        data: UnsafeCell<T>,
+    }
+
+    unsafe impl<T: Send> Sync for SpinLock<T> {}
+    unsafe impl<T: Send> Send for SpinLock<T> {}
+
+    impl<T> SpinLock<T> {
+        pub const fn new(data: T) -> Self {
+            Self {
+                lock: AtomicBool::new(false),
+                data: UnsafeCell::new(data),
+            }
+        }
+
+        pub fn lock(&self) -> SpinLockGuard<T> {
+            while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                // Spin until we can acquire the lock
+                core::hint::spin_loop();
+            }
+            SpinLockGuard { lock: self }
+        }
+    }
+
+    pub struct SpinLockGuard<'a, T> {
+        lock: &'a SpinLock<T>,
+    }
+
+    impl<'a, T> core::ops::Deref for SpinLockGuard<'a, T> {
+        type Target = T;
+
+        fn deref(&self) -> &Self::Target {
+            unsafe { &*self.lock.data.get() }
+        }
+    }
+
+    impl<'a, T> core::ops::DerefMut for SpinLockGuard<'a, T> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            unsafe { &mut *self.lock.data.get() }
+        }
+    }
+
+    impl<'a, T> Drop for SpinLockGuard<'a, T> {
+        fn drop(&mut self) {
+            self.lock.lock.store(false, Ordering::Release);
+        }
+    }
+
+    /// A file backend with read caching for block devices.
+    /// 
+    /// This provides a caching layer that stores the most recently read sector
+    /// to improve performance for sequential reads. The cache is automatically
+    /// invalidated when writing to the cached sector.
+    pub struct FileBackend<T> {
+        /// The underlying backend that performs actual I/O operations
+        backend: SpinLock<T>,
+        /// Cache state protected by spinlock for thread safety
+        cache: SpinLock<CacheState>,
+    }
+
+    /// Internal cache state
+    struct CacheState {
+        /// Cache data for one sector (SECTOR_SIZE bytes)
+        data: [u8; SECTOR_SIZE],
+        /// The sector number that is currently cached, or None if cache is invalid
+        sector: Option<u64>,
+    }
+
+    /// Trait for backends that can read and write sectors
+    pub trait SectorIO {
+        /// Read a single sector into the provided buffer
+        fn read_sector(&mut self, sector: u64, buf: &mut [u8]) -> Result<()>;
+        
+        /// Write a single sector from the provided buffer
+        fn write_sector(&mut self, sector: u64, buf: &[u8]) -> Result<()>;
+    }
+
+    impl<T: SectorIO> FileBackend<T> {
+        /// Create a new FileBackend with the given underlying backend
+        pub fn new(backend: T) -> Self {
+            Self {
+                backend: SpinLock::new(backend),
+                cache: SpinLock::new(CacheState {
+                    data: [0; SECTOR_SIZE],
+                    sector: None,
+                }),
+            }
+        }
+
+        /// Read a single sector with caching
+        /// 
+        /// First checks the cache for the requested sector. If found, returns the cached data.
+        /// If not found, reads from the underlying backend and updates the cache.
+        pub fn read(&self, sector: u64, buf: &mut [u8]) -> Result<()> {
+            if buf.len() != SECTOR_SIZE {
+                return Err(Error::InvalidParam);
+            }
+
+            // Check cache first
+            {
+                let cache = self.cache.lock();
+                if cache.sector == Some(sector) {
+                    // Cache hit - return cached data
+                    buf.copy_from_slice(&cache.data);
+                    return Ok(());
+                }
+            }
+
+            // Cache miss - read from backend
+            {
+                let mut backend = self.backend.lock();
+                backend.read_sector(sector, buf)?;
+            }
+
+            // Update cache with newly read data
+            {
+                let mut cache = self.cache.lock();
+                cache.data.copy_from_slice(buf);
+                cache.sector = Some(sector);
+            }
+
+            Ok(())
+        }
+
+        /// Write a single sector with cache invalidation
+        /// 
+        /// Writes the data to the underlying backend and invalidates the cache
+        /// if the written sector matches the cached sector.
+        pub fn write(&self, sector: u64, buf: &[u8]) -> Result<()> {
+            if buf.len() != SECTOR_SIZE {
+                return Err(Error::InvalidParam);
+            }
+
+            // Write to backend first
+            {
+                let mut backend = self.backend.lock();
+                backend.write_sector(sector, buf)?;
+            }
+
+            // Invalidate cache if writing to cached sector
+            {
+                let mut cache = self.cache.lock();
+                if cache.sector == Some(sector) {
+                    cache.sector = None; // Invalidate cache
+                }
+            }
+
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+pub use file_backend::{FileBackend, SectorIO};
+
 bitflags! {
     #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
     struct BlkFeature: u64 {
@@ -565,109 +728,6 @@ mod tests {
     use alloc::{sync::Arc, vec};
     use core::mem::size_of;
     use std::{sync::Mutex, thread};
-
-    /// A file backend with read caching for block devices.
-    /// 
-    /// This provides a caching layer that stores the most recently read sector
-    /// to improve performance for sequential reads. The cache is automatically
-    /// invalidated when writing to the cached sector.
-    pub struct FileBackend<T> {
-        /// The underlying backend that performs actual I/O operations
-        backend: Arc<Mutex<T>>,
-        /// Cache state protected by mutex for thread safety
-        cache: Arc<Mutex<CacheState>>,
-    }
-
-    /// Internal cache state
-    struct CacheState {
-        /// Cache data for one sector (SECTOR_SIZE bytes)
-        data: [u8; SECTOR_SIZE],
-        /// The sector number that is currently cached, or None if cache is invalid
-        sector: Option<u64>,
-    }
-
-    /// Trait for backends that can read and write sectors
-    pub trait SectorIO {
-        /// Read a single sector into the provided buffer
-        fn read_sector(&mut self, sector: u64, buf: &mut [u8]) -> Result<()>;
-        
-        /// Write a single sector from the provided buffer
-        fn write_sector(&mut self, sector: u64, buf: &[u8]) -> Result<()>;
-    }
-
-    impl<T: SectorIO> FileBackend<T> {
-        /// Create a new FileBackend with the given underlying backend
-        pub fn new(backend: T) -> Self {
-            Self {
-                backend: Arc::new(Mutex::new(backend)),
-                cache: Arc::new(Mutex::new(CacheState {
-                    data: [0; SECTOR_SIZE],
-                    sector: None,
-                })),
-            }
-        }
-
-        /// Read a single sector with caching
-        /// 
-        /// First checks the cache for the requested sector. If found, returns the cached data.
-        /// If not found, reads from the underlying backend and updates the cache.
-        pub fn read(&self, sector: u64, buf: &mut [u8]) -> Result<()> {
-            if buf.len() != SECTOR_SIZE {
-                return Err(Error::InvalidParam);
-            }
-
-            // Check cache first
-            {
-                let cache = self.cache.lock().unwrap();
-                if cache.sector == Some(sector) {
-                    // Cache hit - return cached data
-                    buf.copy_from_slice(&cache.data);
-                    return Ok(());
-                }
-            }
-
-            // Cache miss - read from backend
-            {
-                let mut backend = self.backend.lock().unwrap();
-                backend.read_sector(sector, buf)?;
-            }
-
-            // Update cache with newly read data
-            {
-                let mut cache = self.cache.lock().unwrap();
-                cache.data.copy_from_slice(buf);
-                cache.sector = Some(sector);
-            }
-
-            Ok(())
-        }
-
-        /// Write a single sector with cache invalidation
-        /// 
-        /// Writes the data to the underlying backend and invalidates the cache
-        /// if the written sector matches the cached sector.
-        pub fn write(&self, sector: u64, buf: &[u8]) -> Result<()> {
-            if buf.len() != SECTOR_SIZE {
-                return Err(Error::InvalidParam);
-            }
-
-            // Write to backend first
-            {
-                let mut backend = self.backend.lock().unwrap();
-                backend.write_sector(sector, buf)?;
-            }
-
-            // Invalidate cache if writing to cached sector
-            {
-                let mut cache = self.cache.lock().unwrap();
-                if cache.sector == Some(sector) {
-                    cache.sector = None; // Invalidate cache
-                }
-            }
-
-            Ok(())
-        }
-    }
 
     #[test]
     fn config() {
