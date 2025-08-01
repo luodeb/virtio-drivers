@@ -493,6 +493,9 @@ impl Default for BlkResp {
 /// size.
 pub const SECTOR_SIZE: usize = 512;
 
+/// The standard sector size as a u64 constant.
+pub const SECTOR_SIZE_U64: u64 = SECTOR_SIZE as u64;
+
 bitflags! {
     #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
     struct BlkFeature: u64 {
@@ -562,6 +565,109 @@ mod tests {
     use alloc::{sync::Arc, vec};
     use core::mem::size_of;
     use std::{sync::Mutex, thread};
+
+    /// A file backend with read caching for block devices.
+    /// 
+    /// This provides a caching layer that stores the most recently read sector
+    /// to improve performance for sequential reads. The cache is automatically
+    /// invalidated when writing to the cached sector.
+    pub struct FileBackend<T> {
+        /// The underlying backend that performs actual I/O operations
+        backend: Arc<Mutex<T>>,
+        /// Cache state protected by mutex for thread safety
+        cache: Arc<Mutex<CacheState>>,
+    }
+
+    /// Internal cache state
+    struct CacheState {
+        /// Cache data for one sector (SECTOR_SIZE bytes)
+        data: [u8; SECTOR_SIZE],
+        /// The sector number that is currently cached, or None if cache is invalid
+        sector: Option<u64>,
+    }
+
+    /// Trait for backends that can read and write sectors
+    pub trait SectorIO {
+        /// Read a single sector into the provided buffer
+        fn read_sector(&mut self, sector: u64, buf: &mut [u8]) -> Result<()>;
+        
+        /// Write a single sector from the provided buffer
+        fn write_sector(&mut self, sector: u64, buf: &[u8]) -> Result<()>;
+    }
+
+    impl<T: SectorIO> FileBackend<T> {
+        /// Create a new FileBackend with the given underlying backend
+        pub fn new(backend: T) -> Self {
+            Self {
+                backend: Arc::new(Mutex::new(backend)),
+                cache: Arc::new(Mutex::new(CacheState {
+                    data: [0; SECTOR_SIZE],
+                    sector: None,
+                })),
+            }
+        }
+
+        /// Read a single sector with caching
+        /// 
+        /// First checks the cache for the requested sector. If found, returns the cached data.
+        /// If not found, reads from the underlying backend and updates the cache.
+        pub fn read(&self, sector: u64, buf: &mut [u8]) -> Result<()> {
+            if buf.len() != SECTOR_SIZE {
+                return Err(Error::InvalidParam);
+            }
+
+            // Check cache first
+            {
+                let cache = self.cache.lock().unwrap();
+                if cache.sector == Some(sector) {
+                    // Cache hit - return cached data
+                    buf.copy_from_slice(&cache.data);
+                    return Ok(());
+                }
+            }
+
+            // Cache miss - read from backend
+            {
+                let mut backend = self.backend.lock().unwrap();
+                backend.read_sector(sector, buf)?;
+            }
+
+            // Update cache with newly read data
+            {
+                let mut cache = self.cache.lock().unwrap();
+                cache.data.copy_from_slice(buf);
+                cache.sector = Some(sector);
+            }
+
+            Ok(())
+        }
+
+        /// Write a single sector with cache invalidation
+        /// 
+        /// Writes the data to the underlying backend and invalidates the cache
+        /// if the written sector matches the cached sector.
+        pub fn write(&self, sector: u64, buf: &[u8]) -> Result<()> {
+            if buf.len() != SECTOR_SIZE {
+                return Err(Error::InvalidParam);
+            }
+
+            // Write to backend first
+            {
+                let mut backend = self.backend.lock().unwrap();
+                backend.write_sector(sector, buf)?;
+            }
+
+            // Invalidate cache if writing to cached sector
+            {
+                let mut cache = self.cache.lock().unwrap();
+                if cache.sector == Some(sector) {
+                    cache.sector = None; // Invalidate cache
+                }
+            }
+
+            Ok(())
+        }
+    }
 
     #[test]
     fn config() {
@@ -870,5 +976,158 @@ mod tests {
         assert_eq!(&id[0..length], b"device_id");
 
         handle.join().unwrap();
+    }
+
+    // Mock backend for testing FileBackend
+    struct MockBackend {
+        pub data: std::collections::HashMap<u64, [u8; SECTOR_SIZE]>,
+        pub read_count: Arc<Mutex<u32>>,
+        pub write_count: Arc<Mutex<u32>>,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                data: std::collections::HashMap::new(),
+                read_count: Arc::new(Mutex::new(0)),
+                write_count: Arc::new(Mutex::new(0)),
+            }
+        }
+    }
+
+    impl SectorIO for MockBackend {
+        fn read_sector(&mut self, sector: u64, buf: &mut [u8]) -> Result<()> {
+            *self.read_count.lock().unwrap() += 1;
+            if let Some(data) = self.data.get(&sector) {
+                buf.copy_from_slice(data);
+            } else {
+                // Fill with pattern to identify sector
+                buf.fill(sector as u8);
+            }
+            Ok(())
+        }
+
+        fn write_sector(&mut self, sector: u64, buf: &[u8]) -> Result<()> {
+            *self.write_count.lock().unwrap() += 1;
+            let mut sector_data = [0u8; SECTOR_SIZE];
+            sector_data.copy_from_slice(buf);
+            self.data.insert(sector, sector_data);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn file_backend_cache_hit() {
+        let backend = MockBackend::new();
+        let read_count = backend.read_count.clone();
+        let file_backend = FileBackend::new(backend);
+
+        let mut buf1 = [0u8; SECTOR_SIZE];
+        let mut buf2 = [0u8; SECTOR_SIZE];
+
+        // First read should miss cache and read from backend
+        file_backend.read(42, &mut buf1).unwrap();
+        assert_eq!(*read_count.lock().unwrap(), 1);
+        assert_eq!(buf1[0], 42); // MockBackend fills with sector number
+
+        // Second read of same sector should hit cache
+        file_backend.read(42, &mut buf2).unwrap();
+        assert_eq!(*read_count.lock().unwrap(), 1); // Should not increment
+        assert_eq!(buf1, buf2); // Should return same data
+    }
+
+    #[test]
+    fn file_backend_cache_miss() {
+        let backend = MockBackend::new();
+        let read_count = backend.read_count.clone();
+        let file_backend = FileBackend::new(backend);
+
+        let mut buf1 = [0u8; SECTOR_SIZE];
+        let mut buf2 = [0u8; SECTOR_SIZE];
+
+        // Read sector 42
+        file_backend.read(42, &mut buf1).unwrap();
+        assert_eq!(*read_count.lock().unwrap(), 1);
+        assert_eq!(buf1[0], 42);
+
+        // Read different sector 43 - should miss cache
+        file_backend.read(43, &mut buf2).unwrap();
+        assert_eq!(*read_count.lock().unwrap(), 2); // Should increment
+        assert_eq!(buf2[0], 43);
+        assert_ne!(buf1, buf2);
+    }
+
+    #[test]
+    fn file_backend_write_invalidates_cache() {
+        let backend = MockBackend::new();
+        let read_count = backend.read_count.clone();
+        let write_count = backend.write_count.clone();
+        let file_backend = FileBackend::new(backend);
+
+        let mut buf = [0u8; SECTOR_SIZE];
+        let write_data = [0xAAu8; SECTOR_SIZE];
+
+        // Read sector 42 to populate cache
+        file_backend.read(42, &mut buf).unwrap();
+        assert_eq!(*read_count.lock().unwrap(), 1);
+        assert_eq!(buf[0], 42);
+
+        // Write to same sector should invalidate cache
+        file_backend.write(42, &write_data).unwrap();
+        assert_eq!(*write_count.lock().unwrap(), 1);
+
+        // Read again should miss cache and read from backend
+        file_backend.read(42, &mut buf).unwrap();
+        assert_eq!(*read_count.lock().unwrap(), 2); // Should increment
+        assert_eq!(buf[0], 0xAA); // Should return written data
+    }
+
+    #[test]
+    fn file_backend_write_different_sector_preserves_cache() {
+        let backend = MockBackend::new();
+        let read_count = backend.read_count.clone();
+        let write_count = backend.write_count.clone();
+        let file_backend = FileBackend::new(backend);
+
+        let mut buf = [0u8; SECTOR_SIZE];
+        let write_data = [0xAAu8; SECTOR_SIZE];
+
+        // Read sector 42 to populate cache
+        file_backend.read(42, &mut buf).unwrap();
+        assert_eq!(*read_count.lock().unwrap(), 1);
+        assert_eq!(buf[0], 42);
+
+        // Write to different sector 43 should not invalidate cache
+        file_backend.write(43, &write_data).unwrap();
+        assert_eq!(*write_count.lock().unwrap(), 1);
+
+        // Read sector 42 again should hit cache
+        file_backend.read(42, &mut buf).unwrap();
+        assert_eq!(*read_count.lock().unwrap(), 1); // Should not increment
+        assert_eq!(buf[0], 42);
+    }
+
+    #[test]
+    fn file_backend_invalid_buffer_size() {
+        let backend = MockBackend::new();
+        let file_backend = FileBackend::new(backend);
+
+        let mut small_buf = [0u8; SECTOR_SIZE - 1];
+        let mut large_buf = [0u8; SECTOR_SIZE + 1];
+
+        // Read with wrong buffer size should fail
+        assert_eq!(file_backend.read(42, &mut small_buf), Err(Error::InvalidParam));
+        assert_eq!(file_backend.read(42, &mut large_buf), Err(Error::InvalidParam));
+
+        // Write with wrong buffer size should fail
+        assert_eq!(file_backend.write(42, &small_buf), Err(Error::InvalidParam));
+        assert_eq!(file_backend.write(42, &large_buf), Err(Error::InvalidParam));
+    }
+
+    #[test]
+    fn file_backend_constants() {
+        // Test that SECTOR_SIZE_U64 is correctly defined
+        assert_eq!(SECTOR_SIZE_U64, 512u64);
+        assert_eq!(SECTOR_SIZE_U64 as usize, SECTOR_SIZE);
     }
 }
