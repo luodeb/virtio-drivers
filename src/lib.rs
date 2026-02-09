@@ -54,7 +54,8 @@ pub mod device;
 #[cfg(feature = "embedded-io")]
 mod embedded_io;
 mod hal;
-mod queue;
+/// Virtqueue implementation and helpers.
+pub mod queue;
 pub mod transport;
 
 use device::socket::SocketError;

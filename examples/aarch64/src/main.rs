@@ -42,6 +42,7 @@ use virtio_drivers::{
         socket::{
             VirtIOSocket, VsockAddr, VsockConnectionManager, VsockEventType, VMADDR_CID_HOST,
         },
+        virtio_9p::VirtIO9p,
     },
     transport::{
         mmio::{MmioTransport, VirtIOHeader},
@@ -213,6 +214,7 @@ fn virtio_device(transport: impl Transport) {
             Ok(()) => info!("virtio-socket test finished successfully"),
             Err(e) => error!("virtio-socket test finished with error '{e:?}'"),
         },
+        DeviceType::_9P => virtio_9p(transport),
         DeviceType::EntropySource => virtio_rng(transport),
         t => warn!("Unrecognized virtio device: {:?}", t),
     }
@@ -242,6 +244,70 @@ fn virtio_blk<T: Transport>(transport: T) {
         assert_eq!(input, output);
     }
     info!("virtio-blk test finished");
+}
+
+fn virtio_9p<T: Transport>(transport: T) {
+    let mut p9 = VirtIO9p::<HalImpl, T>::new(transport).expect("failed to create 9p driver");
+    info!("virtio-9p mount tag: {}", p9.mount_tag());
+
+    let mut req = [0u8; 128];
+    let mut resp = [0u8; 256];
+    let req_len = build_tversion_request(&mut req, 16384, "9P2000.L")
+        .expect("failed to build 9p Tversion request");
+    let resp_len = p9
+        .request(&req[..req_len], &mut resp)
+        .expect("failed to send 9p request");
+    parse_rversion_response(&resp[..resp_len]).expect("invalid 9p Rversion response");
+    info!("virtio-9p test finished");
+}
+
+fn build_tversion_request(buf: &mut [u8], msize: u32, version: &str) -> Option<usize> {
+    const TVERSION: u8 = 100;
+    const NOTAG: u16 = 0xffff;
+
+    let vbytes = version.as_bytes();
+    let size = 4 + 1 + 2 + 4 + 2 + vbytes.len();
+    if buf.len() < size || vbytes.len() > u16::MAX as usize {
+        return None;
+    }
+
+    buf[0..4].copy_from_slice(&(size as u32).to_le_bytes());
+    buf[4] = TVERSION;
+    buf[5..7].copy_from_slice(&NOTAG.to_le_bytes());
+    buf[7..11].copy_from_slice(&msize.to_le_bytes());
+    buf[11..13].copy_from_slice(&(vbytes.len() as u16).to_le_bytes());
+    buf[13..13 + vbytes.len()].copy_from_slice(vbytes);
+    Some(size)
+}
+
+fn parse_rversion_response(resp: &[u8]) -> Option<()> {
+    const RVERSION: u8 = 101;
+    const NOTAG: u16 = 0xffff;
+
+    if resp.len() < 13 {
+        return None;
+    }
+
+    let size = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]) as usize;
+    if size > resp.len() {
+        return None;
+    }
+    if resp[4] != RVERSION {
+        return None;
+    }
+    if u16::from_le_bytes([resp[5], resp[6]]) != NOTAG {
+        return None;
+    }
+
+    let msize = u32::from_le_bytes([resp[7], resp[8], resp[9], resp[10]]);
+    let name_len = u16::from_le_bytes([resp[11], resp[12]]) as usize;
+    let name_end = 13 + name_len;
+    if name_end > size {
+        return None;
+    }
+    let version = core::str::from_utf8(&resp[13..name_end]).ok()?;
+    info!("virtio-9p rversion: msize={}, version={}", msize, version);
+    Some(())
 }
 
 fn virtio_gpu<T: Transport>(transport: T) {
