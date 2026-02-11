@@ -2,7 +2,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use log::warn;
+use log::debug;
 
 use super::common::Feature;
 use crate::{queue::VirtQueue, transport::Transport, Error, Hal, Result};
@@ -57,7 +57,7 @@ impl<H: Hal, T: Transport> VirtIO9p<H, T> {
             .add_notify_wait_pop(&[req], &mut [resp], &mut self.transport)?;
 
         let size = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]) as usize;
-        warn!(
+        debug!(
             "virtio-9p resp sizes: used_len={}, payload_len={}",
             used_len, size
         );
