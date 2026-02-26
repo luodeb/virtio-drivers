@@ -9,6 +9,7 @@ use crate::{queue::VirtQueue, transport::Transport, Error, Hal, Result};
 
 const QUEUE: u16 = 0;
 const QUEUE_SIZE: usize = 16;
+const P9_HEADER_SIZE: usize = 7; // size (4) + type (1) + tag (2)
 const SUPPORTED_FEATURES: Feature = Feature::RING_INDIRECT_DESC
     .union(Feature::RING_EVENT_IDX)
     .union(Feature::VERSION_1);
@@ -48,22 +49,27 @@ impl<H: Hal, T: Transport> VirtIO9p<H, T> {
     }
 
     /// Sends a raw 9p request and waits for the response.
-    pub fn request(&mut self, req: &[u8], resp: &mut [u8]) -> Result<usize> {
-        if req.is_empty() || resp.len() < 7 {
+    pub fn request(&mut self, req: &[u8], resp: &mut [u8]) -> Result<u32> {
+        if req.is_empty() || resp.len() < P9_HEADER_SIZE {
             return Err(Error::InvalidParam);
         }
         let used_len = self
             .queue
             .add_notify_wait_pop(&[req], &mut [resp], &mut self.transport)?;
 
-        let size = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]) as usize;
+        let size = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+        if size > used_len {
+            debug!(
+                "virtio-9p resp length mismatch: used_len={}, payload_len={}",
+                used_len, size
+            );
+        }
         debug!(
             "virtio-9p resp sizes: used_len={}, payload_len={}",
             used_len, size
         );
-        Ok(size.min(resp.len()))
+        Ok(used_len.min(size).min(resp.len() as u32))
     }
-
 }
 
 fn read_mount_tag<T: Transport>(transport: &T) -> Result<String> {
