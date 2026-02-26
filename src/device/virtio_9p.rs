@@ -33,7 +33,7 @@ impl<H: Hal, T: Transport> VirtIO9p<H, T> {
         )?;
         transport.finish_init();
 
-        let mount_tag = read_mount_tag(&transport).ok_or(Error::InvalidParam)?;
+        let mount_tag = read_mount_tag(&transport)?;
 
         Ok(Self {
             transport,
@@ -63,19 +63,21 @@ impl<H: Hal, T: Transport> VirtIO9p<H, T> {
         );
         Ok(size.min(resp.len()))
     }
+
 }
 
-fn read_mount_tag<T: Transport>(transport: &T) -> Option<String> {
-    let tag_len: u16 = transport.read_config_space(0).ok()?;
+fn read_mount_tag<T: Transport>(transport: &T) -> Result<String> {
+    let tag_len: u16 = transport.read_config_space(0)?;
     if tag_len == 0 {
-        return None;
+        return Err(Error::InvalidParam);
     }
 
     let mut bytes = Vec::with_capacity(tag_len as usize);
     for idx in 0..tag_len as usize {
-        let b: u8 = transport.read_config_space(2 + idx).ok()?;
+        let b: u8 = transport.read_config_space(2 + idx)?;
         bytes.push(b);
     }
 
-    String::from_utf8(bytes).ok()
+    Ok(String::from_utf8(bytes)?)
 }
+

@@ -54,7 +54,6 @@ pub mod device;
 #[cfg(feature = "embedded-io")]
 mod embedded_io;
 mod hal;
-/// Virtqueue implementation and helpers.
 pub mod queue;
 pub mod transport;
 

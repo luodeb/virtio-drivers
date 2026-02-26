@@ -1,6 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+//! Virtqueue implementation and helpers.
 
-/// Owning variants of virtqueue helpers.
 #[cfg(feature = "alloc")]
 pub mod owning;
 
